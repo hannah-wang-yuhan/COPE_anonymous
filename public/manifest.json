@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "COPE-perplexity",
+  "name": "COPE",
   "version": "1.0.0",
-  "description": "Chat Observer and Performance Evaluator for Perplexity.",
+  "description": "Chat Observer and Performance Evaluator.",
   "permissions": [
     "activeTab",
     "scripting",

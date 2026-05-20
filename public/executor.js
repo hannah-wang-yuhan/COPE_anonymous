@@ -29,6 +29,7 @@
       });
       
       document.body.appendChild(panel);
+      // 尝试恢复历史位置
       loadPosition();
   
       const closeBtn = document.getElementById("cope-close-btn");
@@ -143,16 +144,18 @@
           if (!isListening) {
             startListening();
             setFinishUI();
-            currentPress = { startTime: new Date().toISOString() };
+            pressSession = { startTime: new Date().toISOString() }; 
           } else {
+           
+            if (pressSession) {
+              pressSession.finishTime = new Date().toISOString();
+              pressEvents.push(pressSession);
+              chrome?.runtime?.sendMessage?.({ type: 'pressSession', payload: pressSession });
+              pressSession = null;
+            }
       
             
             setStartUI();
-            if (currentPress) {
-              currentPress.finishTime = new Date().toISOString();
-              pressEvents.push(currentPress);
-              currentPress = null;
-            }
             stopListening();
           }
         } catch (e) {
@@ -165,18 +168,8 @@
       setStartUI();
     }
   
-    //const selector = '.text-base.my-auto.mx-auto';
-    
-    // 每组消息容器
-    const groupSelector = '.isolate.mx-auto.px-md';
-    // 子级选择器
-    const userSelector = 'div[class*="mb-xs group"]';
-    const systemSelector = 'div[class*="py-md md"]';
-    const systemButtonSelecter = 'div[class*="-mx-md px-md scrollbar"]';
-    const systemRelatedSelector = 'div[class*="py-sm group"]';
-    
-    //const scrollSelector = '.flex.h-full.flex-col.overflow-y-auto';
-    const scrollSelector = '.scrollable-container';
+    const selector = '.text-base.my-auto.mx-auto';
+    const scrollSelector = '.flex.h-full.flex-col.overflow-y-auto';
     const observedElements = new Map();
     const indexMap = {}; 
   
@@ -186,14 +179,10 @@
     let scrollHandler = null;
     let scrollEvents = [];
     let overallButtons = [];
+    let pressSession = null;
     let pressEvents = [];
-    let currentPress = null;
     let ignoreNextScroll = false;
     let buttonClickHandler = null;
-    // 提升滚动状态到模块级，避免多闭包并发
-    let __copeScrollSession = null;
-    let __copeScrollDebounceTimer = null;
-    let __copeLastPush = [];
 
  
   function getFilteredInnerText(root) {
@@ -215,30 +204,28 @@
   
     function sendCapturedData(data) {
       if (chrome?.runtime?.sendMessage) {
-        try { chrome.runtime.sendMessage({ type: 'capturedData', payload: data }); } catch (_) { /* ignore */ }
+        chrome.runtime.sendMessage({ type: 'capturedData', payload: data });
       } else {
         console.warn('chrome.runtime.sendMessage 不可用，数据未发送', data);
       }
-    }
-
-    // 安全发送，避免扩展上下文失效时报错
-    function safeSend(message) {
-      try {
-        if (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.id && typeof chrome.runtime.sendMessage === 'function') {
-          chrome.runtime.sendMessage(message);
-        }
-      } catch (_) { /* ignore */ }
     }
   
     function generateMsgId() {
       return 'msg_' + Date.now() + '_' + Math.random().toString(36).slice(2, 10);
     }
   
-    function observeElement(el, role) {
+    function observeElement(el) {
       if (observedElements.has(el)) return;
   
       const firstSeen = new Date();
       const msgId = generateMsgId();
+  
+      let role;
+      const article = el.closest('article[data-turn]');
+      if (article) {
+        const turn = article.getAttribute('data-turn');
+        role = turn === 'user' ? 'user' : 'system';
+      }
   
       const elData = {
         firstSeen,
@@ -253,39 +240,20 @@
         role,
         pushedToIndex: false,
         navigateDetails: [],
-        pendingNavigate: null,
-        // 当前系统消息使用的按钮名称，用于控制文本是否允许覆盖
-        activeSystemButtonName: 'Answer',
-        // 当前系统按钮模式下的流式文本记录索引（指向 buttons 数组项）
-        activeButtonStreamIdx: null
+        pendingNavigate: null
       };
   
       observedElements.set(el, elData);
   
      
-      const mo = new MutationObserver(() => {
-        const newText = getFilteredInnerText(el);
-        if (newText !== elData.lastText) {
-          
-          if (elData.role === 'user' && elData.pushedToIndex) {
-            return;
-          }
-          // system：仅当当前系统按钮为 Answer 时允许覆盖文本
-          if (elData.role === 'system' && elData.pushedToIndex && (elData.activeSystemButtonName || '').toLowerCase() !== 'answer') {
-            // 不覆盖 lastText，将文本作为本次按钮变更的 text 字段流式写入 buttons 中
-            const now = new Date().toISOString();
-            if (elData.activeButtonStreamIdx == null) {
-              elData.buttons.push({ name: elData.activeSystemButtonName || 'unknown', timestamp: now, text: newText });
-              elData.activeButtonStreamIdx = elData.buttons.length - 1;
-            } else {
-              
-              const idx = elData.activeButtonStreamIdx;
-              const prev = elData.buttons[idx] || {};
-              elData.buttons[idx] = { ...prev, name: elData.activeSystemButtonName || prev.name || 'unknown', timestamp: now, text: newText };
-            }
-            return;
-          }
-          elData.lastText = newText;
+    const mo = new MutationObserver(() => {
+      const newText = getFilteredInnerText(el);
+      if (newText !== elData.lastText) {
+        // 对于 user 消息：一旦已入队（首条文本已记录），后续不再覆盖文本
+        if (elData.role === 'user' && elData.pushedToIndex) {
+          return;
+        }
+        elData.lastText = newText;
   
           
           if (elData.index != null) {
@@ -310,8 +278,8 @@
             } else {
               // 更新已有 msgId（非 user || user 未锁定时）
               if (!(elData.role === 'user')) {
-              for (let item of queue) {
-                if (item[elData.msgId]) {
+                for (let item of queue) {
+                  if (item[elData.msgId]) {
                   item[elData.msgId] = {
                     text: elData.lastText,
                     time_stamp: elData.firstSeen.toISOString(),
@@ -365,7 +333,14 @@
       });
       
   
-     
+      // 复制事件
+      el.addEventListener('copy', () => {
+        const copiedText = window.getSelection()?.toString().trim();
+        if (copiedText) {
+          elData.copyCount++;
+          elData.copyDetails.push({ text: copiedText, length: copiedText.length, timestamp: new Date().toISOString() });
+        }
+      });
 
       // 导航行为监听
       function handleLinkClick(event) {
@@ -378,15 +353,11 @@
         if (target === '_blank' || (event.ctrlKey || event.metaKey)) {
           event.preventDefault();
           
-          
-          const isInlineCitation = !!link.closest('div.citation.inline, .citation.inline, [class*="citation inline"], .gap-two.flex.px-5.pb-2.pt-1');
-          const isTabCitation = !!link.closest('div.citation.inline, .citation.inline, [class*="gap-sm grid"]');
-
           const navigateStart = {
             destination: href,
             start_timestamp: new Date().toISOString(),
             return_timestamp: null,
-            ...(isInlineCitation ? { source: 'inline_link' } : (isTabCitation ? { source: 'tab_link' } : { source: 'source_button' }))
+            source: 'inline_link'
           };
           
           elData.pendingNavigate = navigateStart;
@@ -422,6 +393,104 @@
       // 监听消息元素内的链接点击
       el.addEventListener('click', handleLinkClick, true);
 
+      // 监听source按钮点击后的链接导航
+      function handleSourceClick(event) {
+        const button = event.target.closest('button');
+        if (!button) return;
+        
+        // 检查是否为source按钮
+        const buttonText = button.innerText?.toLowerCase() || '';
+        const ariaLabel = button.getAttribute('aria-label')?.toLowerCase() || '';
+        
+        if (buttonText.includes('sources') || ariaLabel.includes('sources')) {
+          console.log('source button clicked');
+
+          setTimeout(() => {
+            const sourceSidebar = document.querySelector('div[slot="content"]');
+            console.log('source sidebar found', sourceSidebar);
+            if (!sourceSidebar) return;
+          
+            // 给 li 添加监听器
+            function attachLiListeners(li) {
+              if (!li.hasAttribute('data-cope-navigated')) {
+                li.setAttribute('data-cope-navigated', 'true');
+          
+                li.addEventListener('click', (liEvent) => {
+                  const link = li.querySelector('a[href]');
+                  if (!link) return;
+          
+                  const href = link.href;
+                  const target = link.target;
+          
+                  if (target === '_blank' || (liEvent.ctrlKey || liEvent.metaKey)) {
+                    liEvent.preventDefault();
+          
+                    const navigateStart = {
+                      destination: href,
+                      start_timestamp: new Date().toISOString(),
+                      return_timestamp: null,
+                      source: 'source_button'
+                    };
+          
+                    elData.pendingNavigate = navigateStart;
+                    elData.navigateDetails.push(navigateStart);
+          
+                   
+                    window.open(href, '_blank');
+          
+                   
+                    const handleFocus = () => {
+                      if (elData.pendingNavigate && elData.pendingNavigate.destination === href) {
+                        elData.pendingNavigate.return_timestamp = new Date().toISOString();
+                        elData.pendingNavigate = null;
+                        window.removeEventListener('focus', handleFocus);
+                      }
+                    };
+          
+                    window.addEventListener('focus', handleFocus);
+          
+                   
+                    setTimeout(() => {
+                      window.removeEventListener('focus', handleFocus);
+                      if (elData.pendingNavigate && elData.pendingNavigate.destination === href) {
+                        elData.pendingNavigate.return_timestamp = new Date().toISOString();
+                        elData.pendingNavigate = null;
+                      }
+                    }, 5000);
+                  }
+                });
+              }
+            }
+          
+           
+            sourceSidebar.querySelectorAll('li').forEach(attachLiListeners);
+          
+           
+            const observer = new MutationObserver(mutations => {
+              mutations.forEach(mutation => {
+                mutation.addedNodes.forEach(node => {
+                  if (node.nodeType === 1) {
+                    if (node.tagName === 'LI') {
+                      attachLiListeners(node);
+                    } else {
+                      node.querySelectorAll?.('li').forEach(attachLiListeners);
+                    }
+                  }
+                });
+              });
+            });
+          
+            observer.observe(sourceSidebar, {
+              childList: true,
+              subtree: true
+            });
+          }, 100);
+          
+        }
+      }
+
+      // 监听source按钮点击
+      el.addEventListener('click', handleSourceClick, true);
     }
   
     function tryAttachScrollListener() {
@@ -432,155 +501,115 @@
       let el = divs.find(n => (n.scrollHeight || 0) > (n.clientHeight || 0)) || divs[0];
       if (!el) return;
 
-    
-	  if (scrollEl === el && el.__copeScrollHandler__) return;
+      if (scrollEl && scrollHandler) scrollEl.removeEventListener('scroll', scrollHandler);
+
+      scrollEl = el;
+      let session = null;
+      let debounceTimer = null;
+      let lastPush = [];
       
-	  if (scrollEl && scrollHandler) {
-	    try { scrollEl.removeEventListener('scroll', scrollHandler); } catch(_) {}
-	  }
-	  if (scrollEl && scrollEl.__copeScrollHandler__) {
-	    try { scrollEl.removeEventListener('scroll', scrollEl.__copeScrollHandler__); } catch(_) {}
-	    scrollEl.__copeScrollHandler__ = null;
-	  }
-	
-	  scrollEl = el;
-	  if (!Array.isArray(__copeLastPush)) __copeLastPush = [];
-	  const SIGNIFICANT_MOVE_PX = 5;
-			
-		
-		scrollHandler = () => {
-			if (ignoreNextScroll) { ignoreNextScroll = false; return; }
-		
-			const scrollTop = el.scrollTop || 0;
-			const scrollHeight = el.scrollHeight || 0;
-			const clientHeight = el.clientHeight || 0;
-			const maxScrollable = Math.max(1, scrollHeight - clientHeight);
-		
-			let edge = 'none';
-			if (scrollTop <= 0) edge = 'top';
-			else if (scrollTop >= maxScrollable - 2) edge = 'bottom';
-		
-			if (!__copeScrollSession) {
-				__copeScrollSession = { 
-					startTime: new Date().toISOString(), 
-					startScrollTop: scrollTop, 
-					edge, 
-					path: [] 
-				};
-			} else {
-				if (edge !== 'none') __copeScrollSession.edge = edge;
-			}
-		
-		const delta = scrollTop - __copeScrollSession.startScrollTop;
-		if (__copeScrollSession._lastScrollTop == null) __copeScrollSession._lastScrollTop = scrollTop;
-		const deltaSinceLast = scrollTop - __copeScrollSession._lastScrollTop;
-		__copeScrollSession._lastScrollTop = scrollTop;
-			
-			// 获取所有可见的消息元素
-			const visibleEls = [];
-			observedElements.forEach((data, msgEl) => {
-				const rect = msgEl.getBoundingClientRect();
-				if (rect.bottom > 0 && rect.top < window.innerHeight) {
-					visibleEls.push(msgEl);
-				}
-			});
-			
-			let currentVisible = [];
-			visibleEls.forEach(msgEl => {
-				const data = observedElements.get(msgEl);
-				if (data && data.index != null) currentVisible.push(data.index);
-			});
-			
-			const newIndexes = currentVisible.filter(idx => !__copeLastPush.includes(idx));
-			
-			if (delta > 0) newIndexes.sort((a, b) => a - b);
-			else if (delta < 0) newIndexes.sort((a, b) => b - a);
-			
-			__copeScrollSession.path.push(...newIndexes);
-			
-			__copeLastPush = currentVisible.slice();
-			
-			let direction = 'none';
-			if (__copeScrollSession.path.length > 1) {
-				let isAsc = true, isDesc = true;
-				for (let i = 1; i < __copeScrollSession.path.length; i++) {
-					if (__copeScrollSession.path[i] > __copeScrollSession.path[i - 1]) isDesc = false;
-					else if (__copeScrollSession.path[i] < __copeScrollSession.path[i - 1]) isAsc = false;
-				}
-				if (isAsc) direction = 'down';
-				else if (isDesc) direction = 'up';
-				else direction = 'mixed';
-			}
-			
-		// 防抖处理：仅当显著位移时才重置计时器
-		if (Math.abs(deltaSinceLast) >= SIGNIFICANT_MOVE_PX) {
-			if (__copeScrollDebounceTimer) clearTimeout(__copeScrollDebounceTimer);
-			__copeScrollDebounceTimer = setTimeout(() => {
-				if (__copeScrollSession) {
-					const endTime = new Date().toISOString();
-					const endScrollTop = scrollTop;
-					const distance = endScrollTop - __copeScrollSession.startScrollTop;
-					const payload = { 
-						startTime: __copeScrollSession.startTime, 
-						endTime, 
-						startScrollTop: __copeScrollSession.startScrollTop, 
-						endScrollTop, 
-						distance, 
-						edge: __copeScrollSession.edge, 
-						direction, 
-						path: __copeScrollSession.path 
-					};
-					console.log('[scroll segment]', payload);
-					scrollEvents.push(payload);
-					safeSend({ type: 'scrollSession', payload });
-          console.log('update scrollSession');
-					__copeScrollSession = null;
-				}
-			}, 800);
-		}
-		};
-  
+     
+      scrollHandler = () => {
+        if (ignoreNextScroll) { ignoreNextScroll = false; return; }
+      
+        const scrollTop = el.scrollTop || 0;
+        const scrollHeight = el.scrollHeight || 0;
+        const clientHeight = el.clientHeight || 0;
+        const maxScrollable = Math.max(1, scrollHeight - clientHeight);
+      
+        let edge = 'none';
+        if (scrollTop <= 0) edge = 'top';
+        else if (scrollTop >= maxScrollable - 2) edge = 'bottom';
+      
+        if (!session) {
+          session = { 
+            startTime: new Date().toISOString(), 
+            startScrollTop: scrollTop, 
+            edge, 
+            path: [] 
+          };
+        } else {
+          if (edge !== 'none') session.edge = edge;
+        }
+      
+        const delta = scrollTop - session.startScrollTop;
+      
+        const visibleEls = Array.from(document.querySelectorAll(selector)).filter(msgEl => {
+          const rect = msgEl.getBoundingClientRect();
+          return rect.bottom > 0 && rect.top < window.innerHeight;
+        });
+      
+        let currentVisible = [];
+        visibleEls.forEach(msgEl => {
+          const data = observedElements.get(msgEl);
+          if (data && data.index != null) currentVisible.push(data.index);
+        });
+      
+        const newIndexes = currentVisible.filter(idx => !lastPush.includes(idx));
+      
+        if (delta > 0) newIndexes.sort((a, b) => a - b);
+        else if (delta < 0) newIndexes.sort((a, b) => b - a);
+      
+        session.path.push(...newIndexes);
+      
+        lastPush = currentVisible.slice();
+      
+        let direction = 'none';
+        if (session.path.length > 1) {
+          let isAsc = true, isDesc = true;
+          for (let i = 1; i < session.path.length; i++) {
+            if (session.path[i] > session.path[i - 1]) isDesc = false;
+            else if (session.path[i] < session.path[i - 1]) isAsc = false;
+          }
+          if (isAsc) direction = 'down';
+          else if (isDesc) direction = 'up';
+          else direction = 'mixed';
+        }
+      
+        // 防抖处理
+        if (debounceTimer) clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(() => {
+          if (session) {
+            const endTime = new Date().toISOString();
+            const endScrollTop = scrollTop;
+            const distance = endScrollTop - session.startScrollTop;
+            const payload = { 
+              startTime: session.startTime, 
+              endTime, 
+              startScrollTop: session.startScrollTop, 
+              endScrollTop, 
+              distance, 
+              edge: session.edge, 
+              direction, 
+              path: session.path 
+            };
+            scrollEvents.push(payload);
+            chrome?.runtime?.sendMessage?.({ type: 'scrollSession', payload });
+            session = null;
+          }
+        }, 500);
+      };
+      
       
 
-      try { el.addEventListener('scroll', scrollHandler, { passive: true }); } catch(_) { el.addEventListener('scroll', scrollHandler); }
-      el.__copeScrollHandler__ = scrollHandler;
+      el.addEventListener('scroll', scrollHandler);
     }
 
   
     function scanAndObserve() {
       if (!isListening) return;
-      
-      const groups = document.querySelectorAll(groupSelector);
-      
-      groups.forEach(group => {
-        const userMsg = group.querySelector(userSelector);
-        const systemMsg = group.querySelector(systemSelector);
-        
-        if (userMsg) observeElement(userMsg, 'user');
-        if (systemMsg) observeElement(systemMsg, 'system');
-      });
-
-      // 更新索引：按消息组为单位，保证 user 为奇数 (2*q-1)，system 为偶数 (2*q)
-      let q = 1;
-      groups.forEach(group => {
-        const u = group.querySelector(userSelector);
-        const s = group.querySelector(systemSelector);
-        if (u && observedElements.has(u)) {
-          const d = observedElements.get(u);
-          if (d) d.index = 2 * q - 1;
-        }
-        if (s && observedElements.has(s)) {
-          const d = observedElements.get(s);
-          if (d) d.index = 2 * q;
-        }
-        q++;
-      });
-
-      observedElements.forEach((data, el) => {
+      const elements = document.querySelectorAll(selector);
+  
+      elements.forEach(el => { if (!observedElements.has(el)) observeElement(el); });
+  
+      elements.forEach((el, i) => {
+        const data = observedElements.get(el);
         if (!data) return;
+        const prevIndex = data.index;
+        data.index = i + 1;
 
         // !!!初次设置 index 时，若已存在完整文本（非流式），立即 push 一条记录，防止空队列
-        if (!data.pushedToIndex && data.index != null) {
+    if (!data.pushedToIndex && data.index != null) {
       const currentText = getFilteredInnerText(el);
           if (currentText) {
             data.lastText = currentText;
@@ -606,131 +635,75 @@
       tryAttachScrollListener();
     }
     
-    function observeGlobalButtons() {
-        const globalButtonSelector = 'div.erp-sidecar\\:fixed.erp-sidecar\\:w-full.bottom-safeAreaInsetBottom.p-md.pointer-events-none.absolute.z-10.border-subtlest.ring-subtlest.divide-subtlest.bg-transparent';
-        const globalButtonContainer = document.querySelector(globalButtonSelector);
-        if (!globalButtonContainer) return;
-        if (window.__globalButtonObserver__) {
-          window.__globalButtonObserver__.disconnect();
-          window.__globalButtonObserver__ = null;
-        }
+    function observeThreadBottomButtons() {
+        const threadBottom = document.getElementById('thread-bottom');
+        if (!threadBottom) return;
+      
+       
+        if (window.__threadBottomObserver__) window.__threadBottomObserver__.disconnect();
+      
+        const observer = new MutationObserver(mutations => {
+          mutations.forEach(m => {
+            m.addedNodes.forEach(node => {
+              if (!(node instanceof HTMLElement)) return;
+      
+             
+              const buttons = node.tagName === 'BUTTON' ? [node] : Array.from(node.querySelectorAll('button'));
+              buttons.forEach(button => {
+                button.addEventListener('click', e => {
+                  const name = button.getAttribute('aria-label') || button.getAttribute('data-testid') || button.innerText?.trim() || 'unknown';
+                  overallButtons.push({ name, timestamp: new Date().toISOString() });
+                }, { once: false });
+              });
+            });
+          });
+        });
+      
+        observer.observe(threadBottom, { childList: true, subtree: true });
+        window.__threadBottomObserver__ = observer;
+      
+        
+        const existingButtons = threadBottom.querySelectorAll('button');
+        existingButtons.forEach(button => {
+          button.addEventListener('click', e => {
+            const name = button.getAttribute('aria-label') || button.getAttribute('data-testid') || button.innerText?.trim() || 'unknown';
+            overallButtons.push({ name, timestamp: new Date().toISOString() });
+          }, { once: false });
+        });
       }
 
       
     function startListening() {
       if (isListening) return;
       isListening = true;
-
-      
   
       mutationObserver = new MutationObserver(scanAndObserve);
       mutationObserver.observe(document.body, { childList: true, subtree: true });
       scanAndObserve();
 
-      observeGlobalButtons();
+      observeThreadBottomButtons();
 
       if (!buttonClickHandler) {
         buttonClickHandler = event => {
-          const targetEl = event.target instanceof Element ? event.target : null;
-          if (!targetEl) return;
-
-          const group = targetEl.closest(groupSelector);
-
-          // Related 区域
-          const relatedItem = targetEl.closest(systemRelatedSelector);
-          if (relatedItem && group) {
-            const systemMsg = group.querySelector(systemSelector);
-            if (systemMsg && observedElements.has(systemMsg)) {
-              const data = observedElements.get(systemMsg);
-              const now2 = new Date().toISOString();
-              const relatedText = (relatedItem.innerText || relatedItem.textContent || '').trim();
-              data.buttons.push({ name: 'Related', timestamp: now2, text: relatedText });
-            }
-            return; 
-          }
-
-          const button = targetEl.closest('button');
+          const button = event.target.closest('button');
           if (!button) return;
-          
-          let msgEl = null;
-          let elData = null;
-          
-          if (group) {
-            const userMsg = group.querySelector(userSelector);
-            const systemMsg = group.querySelector(systemSelector);
-            const systemBtnScope = group.querySelector(systemButtonSelecter);
-            
-            
-            if (userMsg && userMsg.contains(button)) {
-              msgEl = userMsg;
-            }
-            
-            else if (systemMsg && systemMsg.contains(button)) {
-              msgEl = systemMsg;
-            }
-            // 扩展：如果按钮位于系统按钮范围内，也归属到当前组的 system 消息
-            else if (systemBtnScope && systemBtnScope.contains(button)) {
-              if (systemMsg) {
-                msgEl = systemMsg;
-              } else {
-               
-              }
-            }
-          }
-          
-         
-          if (msgEl && observedElements.has(msgEl)) {
-            elData = observedElements.get(msgEl);
+          const msgEl = button.closest(selector);
+          if (!msgEl) return;
+          if (!observedElements.has(msgEl)) observeElement(msgEl);
+  
+          const elData = observedElements.get(msgEl);
+          if (!elData) return;
           const name = button.getAttribute('aria-label') || button.getAttribute('data-testid') || button.innerText?.trim() || 'unknown';
-            const now = new Date().toISOString();
-           
-            if (elData.role === 'system') {
-              elData.activeSystemButtonName = name || elData.activeSystemButtonName;
-              elData.activeButtonStreamIdx = null; 
-            } else {
-             
-              elData.buttons.push({ name, timestamp: now });
-            }
-          }
-          
+          const now = new Date().toISOString();
+          elData.buttons.push({ name, timestamp: now });
 
-          // 全局按钮
-          const globalButtonSelector = 'div.erp-sidecar\\:fixed.erp-sidecar\\:w-full.bottom-safeAreaInsetBottom.p-md.pointer-events-none.absolute.z-10.border-subtlest.ring-subtlest.divide-subtlest.bg-transparent';
-          const globalButtonContainer = document.querySelector(globalButtonSelector);
-          if (globalButtonContainer && globalButtonContainer.contains(button)) {
-            const name = button.getAttribute('aria-label') || button.getAttribute('data-testid') || button.innerText?.trim() || 'unknown';
+         
+          const threadBottom = document.getElementById('thread-bottom');
+          if (threadBottom && threadBottom.contains(button)) {
             overallButtons.push({ name, timestamp: new Date().toISOString() });
           }
         };
         document.addEventListener('click', buttonClickHandler, true);
-      }
-
-      // 全局复制事件监听器
-      if (!window.__COPE_copyHandler__) {
-        window.__COPE_copyHandler__ = (event) => {
-          const copiedText = window.getSelection()?.toString().trim();
-          if (!copiedText) return;
-
-    
-          const selection = window.getSelection();
-          if (selection.rangeCount > 0) {
-            const range = selection.getRangeAt(0);
-            const container = range.commonAncestorContainer;
-            const element = container.nodeType === Node.TEXT_NODE ? container.parentElement : container;
-            
-          
-            observedElements.forEach((elData, msgEl) => {
-              if (msgEl.contains(element)) {
-                elData.copyDetails.push({ 
-                  text: copiedText, 
-                  length: copiedText.length, 
-                  timestamp: new Date().toISOString() 
-                });
-              }
-            });
-          }
-        };
-        document.addEventListener('copy', window.__COPE_copyHandler__, true);
       }
     }
   
@@ -740,8 +713,6 @@
       if (mutationObserver) mutationObserver.disconnect();
       if (scrollEl && scrollHandler) scrollEl.removeEventListener('scroll', scrollHandler);
       if (buttonClickHandler) document.removeEventListener('click', buttonClickHandler, true);
-      if (window.__COPE_copyHandler__) document.removeEventListener('copy', window.__COPE_copyHandler__, true);
-      if (window.__globalButtonObserver__) window.__globalButtonObserver__.disconnect();
   
       observedElements.forEach(elData => {
         if (elData.mo) elData.mo.disconnect();
